@@ -1,0 +1,661 @@
+diff --git a/init/Android.mk b/init/Android.mk
+index 5072ed3..9673dbf 100644
+--- a/init/Android.mk
++++ b/init/Android.mk
+@@ -171,6 +171,7 @@ LOCAL_SRC_FILES:= \
+     customize_property_whilelist.cpp \
+     verifier.cpp \
+     batt_data.cpp \
++    early_log.cpp \
+ 
+ LOCAL_MODULE:= init
+ LOCAL_C_INCLUDES += \
+diff --git a/init/early_log.cpp b/init/early_log.cpp
+new file mode 100644
+index 0000000..9e2d956
+--- /dev/null
++++ b/init/early_log.cpp
+@@ -0,0 +1,596 @@
++#include <ctype.h>
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <keyutils.h>
++#include <libgen.h>
++#include <paths.h>
++#include <signal.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/epoll.h>
++#include <sys/mount.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <sys/types.h>
++#include <sys/un.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include <selinux/selinux.h>
++#include <selinux/label.h>
++#include <selinux/android.h>
++
++#include <android-base/file.h>
++#include <android-base/properties.h>
++#include <android-base/stringprintf.h>
++#include <android-base/strings.h>
++#include <android-base/unique_fd.h>
++#include <libavb/libavb.h>
++#include <private/android_filesystem_config.h>
++
++#include <fstream>
++#include <memory>
++#include <vector>
++#include <sys/klog.h>
++
++#include <zlib.h>
++
++#include "early_log.h"
++
++static char kbuf[192000] = {0};
++
++// early log control
++#define EARLY_LOG_GET_TIMES                    10
++#define EARLY_LOG_SAVED_LOG_NR                 3
++
++#define MAX_FILE_NAME_LEN                      512
++#define LOG_FILE_MODE                          0666
++
++#define EARLY_LOG_ROOT_DIR                     "/devlog/early_log"
++
++// early log state machine
++#define EARLY_LOG_DEBUG_FILE_OPEN_OK           0
++#define EARLY_LOG_DEBUG_FILE_OPEN_FAIL         1
++#define EARLY_LOG_GET_FIRST_LOG                2
++#define EARLY_LOG_GET_LOG_LOOP                 3
++#define EARLY_LOG_GET_LOG_LOOP_DEVLOG_READY    4
++
++// early log debug
++int fd_debug_parent = -1;
++int fd_debug = -1;
++
++// for compression
++#define COMPRESS_BUFFER_SIZE (524288)
++char mBufferCompress[COMPRESS_BUFFER_SIZE];
++
++// reused buffer
++char file_tmp[MAX_FILE_NAME_LEN] = {0};
++char file_gz_tmp[MAX_FILE_NAME_LEN] = {0};
++
++ssize_t read_nointr (int fd, void *buf, size_t count)
++{
++	ssize_t ret = -1;
++
++	if((fd < 0)||(buf == NULL)||(count <= 0)) {
++		return -1;
++	}
++
++	while(1) {
++		ret = read (fd, buf, count);
++		if (ret < 0)
++		{
++			if (errno == EINTR)
++			{
++				usleep (10000);
++				continue;
++			}
++		}
++		break;
++	}
++	return ret;
++}
++
++ssize_t write_nointr (int fd, const void *buf, size_t count)
++{
++	ssize_t ret = -1;
++
++	if((fd < 0)||(buf == NULL)||(count <= 0)) {
++		return -1;
++	}
++
++	while(1) {
++		ret = write (fd, buf, count);
++		if (ret < 0) {
++			if (errno == EINTR) {
++				usleep (10000);
++				continue;
++			}
++		}
++		break;
++	}
++
++	return ret;
++}
++
++FILE *fopen_nointr (const char *path, const char *mode) {
++	FILE *fp = NULL;
++
++	while (1)
++	{
++		fp = fopen (path, mode);
++
++		if (fp == NULL)
++		{
++			if (errno == EINTR)
++			{
++				usleep (10000);
++				continue;
++			}
++
++			//DE ("fopen [%s] error: [%s] [%d]\n", path, strerror (errno), errno);
++		}
++		break;
++	}
++
++	return fp;
++}
++
++int fclose_nointr (FILE *fp) {
++	int ret = -1;
++
++	while (1)
++	{
++		ret = fclose (fp);
++
++		if (ret == EOF)
++		{
++			if (errno == EINTR)
++			{
++				usleep (10000);
++				continue;
++			}
++
++			//DE ("fclose error: [%s] [%d]\n", strerror (errno), errno);
++		}
++
++		break;
++	}
++
++	return ret;
++}
++
++int file_compress (const char *dest, const char *src)
++{
++	int ret = 0;
++	FILE *in = NULL;
++	gzFile out = NULL;
++	size_t len = 0;
++	size_t count = 0;
++	const char *msg = NULL;
++
++	in = fopen_nointr (src, "rb");
++	if (in == NULL)
++	{
++		return -1;
++	}
++
++	out = gzopen (dest, "wb6");
++	if (out == NULL)
++	{
++		fclose_nointr (in);
++		in = NULL;
++		return -1;
++	}
++
++	while (true)
++	{
++		len = fread (mBufferCompress, 1, COMPRESS_BUFFER_SIZE, in);
++		if (ferror (in) != 0)
++		{
++			ret = -1;
++			break;
++		}
++
++		if (len == 0)
++		{
++			break;
++		}
++
++		count = gzwrite (out, mBufferCompress, len);
++		if (count != len)
++		{
++			msg = gzerror (out, &ret);
++			ret = -1;
++			break;
++		}
++
++		if (feof (in) != 0)
++		{
++			break;
++		}
++	}
++
++	fclose_nointr (in);
++	in = NULL;
++
++	if ((gzclose (out)) != Z_OK)
++	{
++		ret = -1;
++	}
++
++	return ret;
++}
++
++int log_debug(const char *fmt, ...) {
++	va_list ap;
++	char buf [4096];
++	int ret = -1;
++
++	if(fd_debug < 0) {
++		return -1;
++	}
++
++	va_start (ap, fmt);
++	vsnprintf (buf, sizeof (buf), fmt, ap);
++	va_end (ap);
++
++	ret = write(fd_debug, buf, strlen(buf));
++
++	return ret;
++}
++
++int log_debug_parent(const char *fmt, ...) {
++	va_list ap;
++	char buf [4096];
++	int ret = -1;
++
++	if(fd_debug_parent < 0) {
++		return -1;
++	}
++
++	va_start (ap, fmt);
++	vsnprintf (buf, sizeof (buf), fmt, ap);
++	va_end (ap);
++
++	ret = write(fd_debug_parent, buf, strlen(buf));
++
++	return ret;
++}
++
++int log_copy(const char *dst, const char *src) {
++	int fd_dst = -1, fd_src = -1;
++	int count = 0;
++	int ret = -1;
++
++	if((dst == NULL) || (src == NULL)) {
++		return -1;
++	}
++
++	fd_dst = open(dst, O_CREAT | O_RDWR | O_TRUNC, LOG_FILE_MODE);
++	if(fd_dst < 0) {
++		return -1;
++	}
++
++	fd_src = open(src, O_RDONLY, LOG_FILE_MODE);
++	if(fd_src < 0) {
++		close(fd_dst);
++		fd_dst = -1;
++		return -1;
++	}
++
++	count = read_nointr(fd_src, kbuf, sizeof(kbuf)-1);
++	if(count > 0) {
++		ret = write_nointr(fd_dst, kbuf, count);
++	}
++
++	close(fd_dst);
++	close(fd_src);
++	fd_dst = -1;
++	fd_src = -1;
++
++	return ret;
++}
++
++int log_mkdir(char *dir) {
++	int ret = mkdir(dir, 0775);
++	if(ret != 0 && errno != EEXIST) {
++		return -1;
++	}
++	return 0;
++}
++
++int log_rm_file(const char *file_name) {
++	int ret = 0;
++
++	if(file_name == NULL) {
++		return -1;
++	}
++
++	ret = remove(file_name);
++
++	return ret;
++}
++
++int log_get_and_save_log(const char *file_name) {
++	int ret = 0;
++	int fd_tmp = -1;
++	int count = 0;
++
++	fd_tmp = open(file_name, O_CREAT | O_RDWR | O_TRUNC, LOG_FILE_MODE);
++	if(fd_tmp < 0) {
++		log_debug("open file %s fail\n", file_name);
++		return -1;
++	}
++
++	count = klogctl (3, kbuf, sizeof (kbuf) - 1);
++	if(count <= 0) {
++		return -1;
++	}
++
++	ret = write_nointr(fd_tmp, kbuf, count);
++	close(fd_tmp);
++	fd_tmp = -1;
++
++	return ret;
++}
++
++int log_compress(const char *file_name) {
++	int ret = 0;
++
++	memset(file_gz_tmp, 0, MAX_FILE_NAME_LEN);
++	sprintf(file_gz_tmp, "%s.gz", file_name);
++
++	ret = file_compress(file_gz_tmp, file_name);
++	if(ret < 0) {
++		log_debug("file: %s compress failed\n", file_name);
++	} else {
++		ret = log_rm_file(file_name);
++	}
++
++	return ret;
++}
++
++int log_create_test_file() {
++	int ret = 0;
++	int fd_tmp = -1;
++
++	memset(file_tmp, 0, MAX_FILE_NAME_LEN);
++	sprintf(file_tmp, EARLY_LOG_ROOT_DIR "/" "early_log_test_file");
++	fd_tmp = open(file_tmp, O_CREAT | O_RDWR | O_TRUNC, LOG_FILE_MODE); // test /devlog c/w
++
++	if(fd_tmp <= 0) {
++		log_debug("open %s failed\n", file_tmp);
++		return -1;
++	}
++
++	log_debug("%s open ok\n", file_tmp);
++	ret = write_nointr(fd_tmp, "devlog early log write test\n", strlen("devlog early log write test\n"));
++
++	close(fd_tmp);
++	fd_tmp = -1;
++
++	return ret;
++}
++
++void early_log_handle() {
++	int state = -1;
++	int log_file_nr = 0;
++	char cur_log_dir_nr = '0';
++	int ret = -1;
++
++	fd_debug = open("/dev/early_log_debug", O_CREAT | O_RDWR | O_TRUNC, LOG_FILE_MODE);
++
++	if(fd_debug < 0) {
++		state = EARLY_LOG_DEBUG_FILE_OPEN_FAIL;
++	} else {
++		state = EARLY_LOG_DEBUG_FILE_OPEN_OK;
++	}
++
++	while(1) {
++		switch(state) {
++			case EARLY_LOG_DEBUG_FILE_OPEN_OK:
++				log_debug("pid=%d, fd_debug_parent=%d\n", getpid(), fd_debug_parent);
++				log_debug("open file /dev/early_log_debug success\n");
++				state = EARLY_LOG_GET_FIRST_LOG;
++				break;
++
++			case EARLY_LOG_GET_FIRST_LOG:
++				memset(file_tmp, 0, MAX_FILE_NAME_LEN);
++				sprintf(file_tmp, "/dev/early_log_ram");
++				ret = log_get_and_save_log(file_tmp);
++				if(ret < 0) {
++					log_debug("get first kernel log failed\n");
++					goto early_log_exit;
++				}
++				log_debug("get first kernel log ok\n");
++				state = EARLY_LOG_GET_LOG_LOOP;
++				break;
++
++			case EARLY_LOG_GET_LOG_LOOP:
++				if (access ("/devlog/", X_OK) == 0) { // devlog ready
++					int ret = -1;
++					char a[4] = {'N'};
++					int fd_saved_log_nr = -1;
++					int count = -1;
++
++					log_debug("devlog ready\n");
++
++					// create early log root directory
++					memset(file_tmp, 0, MAX_FILE_NAME_LEN);
++					sprintf(file_tmp, EARLY_LOG_ROOT_DIR);
++					ret = log_mkdir(file_tmp);
++					if(ret < 0) {
++						log_debug("open %s failed, errno=%d:%s\n", EARLY_LOG_ROOT_DIR, errno, strerror(errno));
++						sleep(2);
++						goto early_log_exit;
++					}
++
++					// test /devlog access/read/write
++					ret = log_create_test_file();
++					if(ret < 0) {
++						goto early_log_exit;
++					}
++
++					// update log saved number
++					memset(file_tmp, 0, MAX_FILE_NAME_LEN);
++					sprintf(file_tmp, EARLY_LOG_ROOT_DIR "/" "early_log_saved_nr");
++					fd_saved_log_nr = open(file_tmp, O_CREAT | O_RDWR, LOG_FILE_MODE);
++					if(fd_saved_log_nr < 0) {
++						log_debug("open %s failed\n", file_tmp);
++						goto early_log_exit;
++					}
++					count = read_nointr(fd_saved_log_nr, a, 1);
++					if(count != 1 || a[0] >= '0'+EARLY_LOG_SAVED_LOG_NR) {
++						a[0] = '0';
++					} else {
++						a[0]++;
++					}
++					close(fd_saved_log_nr);
++					fd_saved_log_nr = open(file_tmp, O_CREAT | O_RDWR | O_TRUNC, LOG_FILE_MODE);
++					write_nointr(fd_saved_log_nr, a, 1);
++					cur_log_dir_nr = a[0];
++
++					// create early log directory
++					memset(file_tmp, 0, MAX_FILE_NAME_LEN);
++					sprintf(file_tmp, EARLY_LOG_ROOT_DIR "/" "early_log_%c", cur_log_dir_nr);
++					ret = log_mkdir(file_tmp);
++					if(ret < 0) {
++						log_debug("open %s failed\n", file_tmp);
++						goto early_log_exit;
++					}
++
++					// copy ram log to /devlog partition
++					memset(file_tmp, 0, MAX_FILE_NAME_LEN);
++					sprintf(file_tmp, EARLY_LOG_ROOT_DIR "/" "early_log_%c/early_log_ram", cur_log_dir_nr);
++					ret = log_copy(file_tmp, "/dev/early_log_ram");
++					if(ret < 0) {
++						log_debug("copy early_log_ram failed\n");
++						goto early_log_exit;
++					}
++
++					// file compress
++					log_compress(file_tmp);
++
++					// change status to devlog ready
++					state = EARLY_LOG_GET_LOG_LOOP_DEVLOG_READY;
++
++
++				} else { // devlog not ready
++
++					// devlog not ready, sleep 2s
++					log_debug("devlog not ready, sleep 2s\n");
++
++					// get kernel log
++					memset(file_tmp, 0, MAX_FILE_NAME_LEN);
++					sprintf(file_tmp, "/dev/early_log_ram1");
++					log_debug("log_get_and_save_log\n");
++					log_get_and_save_log(file_tmp);
++
++					sleep(2);
++				}
++				break;
++
++			case EARLY_LOG_GET_LOG_LOOP_DEVLOG_READY:
++				// copy early_log_ram1
++				memset(file_tmp, 0, MAX_FILE_NAME_LEN);
++				sprintf(file_tmp, EARLY_LOG_ROOT_DIR "/" "early_log_%c/early_log_ram1", cur_log_dir_nr);
++				if(log_file_nr == 0) { // log_copy will be check whether the file exist
++					ret = log_copy(file_tmp, "/dev/early_log_ram1");
++					if(ret < 0) {
++						log_debug("copy /dev/early_log_ram1 failed\n");
++						goto early_log_exit;
++					}
++					log_compress(file_tmp);
++				}
++
++				// get kernel log to save
++				if(log_file_nr < EARLY_LOG_GET_TIMES) {
++					memset(file_tmp, 0, MAX_FILE_NAME_LEN);
++					sprintf(file_tmp, EARLY_LOG_ROOT_DIR "/" "early_log_%c/early_log_file_%d", cur_log_dir_nr, log_file_nr);
++
++					ret = log_get_and_save_log(file_tmp);
++					if(ret > 0) {
++						log_debug("get log: %s success\n", file_tmp);
++
++						// file compress
++						log_compress(file_tmp);
++					} else {
++						log_debug("get log: %s failed\n", file_tmp);
++					}
++
++					log_file_nr++;
++					sleep(2);
++				} else {
++					goto early_log_exit;
++				}
++				break;
++
++			case EARLY_LOG_DEBUG_FILE_OPEN_FAIL:
++			default:
++				goto early_log_exit;
++		}
++	}
++
++early_log_exit:
++	// get kernel log for debug
++	log_debug("catch kernel log before early log exit\n");
++debug_loop:
++	ret = log_get_and_save_log("/dev/early_log_exit_debug");
++	if(ret < 0) {
++		sleep(2);
++		goto debug_loop;
++	}
++
++	// close file handlers and exit
++	if(fd_debug > 0) {
++		log_debug("early_log_exit\n");
++		close(fd_debug);
++		fd_debug = -1;
++	}
++
++	// copy early_log_debug file
++	memset(file_tmp, 0, MAX_FILE_NAME_LEN);
++	sprintf(file_tmp, EARLY_LOG_ROOT_DIR "/early_log_debug");
++	ret = log_copy(file_tmp, "/dev/early_log_debug");
++	if(ret < 0) {
++		log_debug("save /dev/early_log_debug failed\n");
++	}
++	sleep(2);
++
++	exit(0);
++}
++
++void early_log_fork() {
++	// open debug file
++	fd_debug_parent = open("/dev/early_log_debug_parent", O_CREAT | O_RDWR | O_TRUNC, LOG_FILE_MODE);
++	if(fd_debug_parent < 0) {
++		return;
++	}
++
++	pid_t child = fork();
++
++	if (child < 0) {
++		// fork failed
++		log_debug_parent("fork child process failed\n");
++	} else if (child == 0) {
++		int ret = -1;
++		// child process
++		log_debug_parent("fork child process success, pid=%d, fd_debug_parent=%d\n", getpid(), fd_debug_parent);
++		ret = execl("/init", "/init", "early_log", (char *)NULL);
++		if(ret < 0) {
++			log_debug_parent("execl error, errno=%d:%s\n", errno, strerror(errno));
++			_exit(0);
++		}
++		//early_log_handle();
++	} else {
++		// parent process
++		log_debug("parent process, pid=%d, fd_debug_parent=%d\n", getpid(), fd_debug_parent);
++		close(fd_debug_parent);
++		fd_debug_parent = -1;
++	}
++}
+diff --git a/init/early_log.h b/init/early_log.h
+new file mode 100644
+index 0000000..8047a70
+--- /dev/null
++++ b/init/early_log.h
+@@ -0,0 +1,7 @@
++#ifndef EARLY_LOG_H
++#define EARLY_LOG_H
++
++void early_log_fork();
++void early_log_handle();
++
++#endif
+diff --git a/init/init.cpp b/init/init.cpp
+index 2cac657..a4ac48b 100755
+--- a/init/init.cpp
++++ b/init/init.cpp
+@@ -70,6 +70,8 @@
+ #include "util.h"
+ #include "watchdogd.h"
+ 
++#include "early_log.h"
++
+ using android::base::GetProperty;
+ using android::base::StringPrintf;
+ 
+@@ -1114,6 +1116,10 @@ static void install_reboot_signal_handlers() {
+ }
+ 
+ int main(int argc, char** argv) {
++    if((argc == 2) && !strcmp(argv[1], "early_log")) {
++        early_log_handle();
++	return 0;
++    }
+     if (!strcmp(basename(argv[0]), "ueventd")) {
+         return ueventd_main(argc, argv);
+     }
+@@ -1167,6 +1173,9 @@ int main(int argc, char** argv) {
+ 
+         SetInitAvbVersionInRecovery();
+ 
++	// fork a process to get early kernel log
++	early_log_fork();
++
+         // Set up SELinux, loading the SELinux policy.
+         selinux_initialize(true);
+ 

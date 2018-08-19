@@ -1,0 +1,16 @@
+diff --git a/common/kernel.te b/common/kernel.te
+index ae0dcd2..abbd912 100644
+--- a/common/kernel.te
++++ b/common/kernel.te
+@@ -39,3 +39,11 @@ allow kernel self:socket create_socket_perms_no_ioctl;
+ allow kernel ktop_accu_file:file { open read write };
+ 
+ allow kernel debugfs_mmc:dir { search };
++
++# for early log
++allow kernel tmpfs:file {open read write create};
++allow kernel kernel:system syslog_read;
++allow kernel htc_ebdlogd_file:dir {create open read write search add_name remove_name};
++allow kernel htc_ebdlogd_file:file {create open read write unlink};
++allow kernel device:dir {open read write add_name};
++allow kernel device:file {create open read write};
